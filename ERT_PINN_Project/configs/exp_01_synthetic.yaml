@@ -1,0 +1,27 @@
+# Arquitectura Red Neuronal
+network:
+  sigma_hidden_features: 64
+  sigma_hidden_layers: 4
+  u_hidden_features: 128 # U normalmente necesita más capacidad temporal/espacial
+  u_hidden_layers: 5
+
+# Hiperparametros de Entrenamiento
+training:
+  epochs: 1000
+  lr_sigma: 0.001
+  lr_u: 0.001
+  batch_size: 256
+  
+# Pesos Loss de la Física y Datos
+loss_weights:
+  lambda_data: 1.0
+  lambda_pde: 0.1
+  lambda_tv: 0.05
+
+# Caminos e I/O
+data:
+  train_data_path: "data/synthetic/ideal_data.csv"
+  
+logging:
+  use_wandb: false
+  project_name: "ERT_PINN"
