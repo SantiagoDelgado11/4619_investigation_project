@@ -1,44 +1,45 @@
 import torch
+import math
 
-def compute_pde_loss(u, sigma, x, z, injection_source):
+def compute_pde_loss_dipole(u, sigma, x, z, pos_A, pos_B, I=1.0, epsilon=0.05):
     """
-    Calcula el residual de la Ecuación de Poisson (ERT):
-    nabla . (sigma * nabla u) = I * delta(x)
+    Calcula el residual para un arreglo de dos electrodos (Dipolo).
     
-    Donde:
-      u: (batch_size, 1) Tensor de potencial.
-      sigma: (batch_size, 1) Tensor de conductividad.
-      x: (batch_size, 1) Coordenada espacial x.
-      z: (batch_size, 1) Coordenada espacial z (profundidad).
-      injection_source: (batch_size, 1) Término fuente/sumidero (I * delta)
+    Nuevos Parámetros:
+      pos_A: tupla (x_a, z_a) - Coordenadas del electrodo de INYECCIÓN (+).
+      pos_B: tupla (x_b, z_b) - Coordenadas del electrodo de EXTRACCIÓN (-).
+      I: Magnitud de la corriente inyectada (escalar).
+      epsilon: Radio de suavizado de la corriente (controla qué tan "puntual" es el electrodo).
     """
-    # 1. Gradientes de U (nabla u)
+    # 1. Gradientes y Divergencia (La física del flujo se mantiene igual)
     u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
     u_z = torch.autograd.grad(u, z, grad_outputs=torch.ones_like(u), create_graph=True)[0]
     
-    # 2. Flujo conductivo (sigma * nabla u)
     J_x = sigma * u_x
     J_z = sigma * u_z
     
-    # 3. Divergencia del flujo conductivo nabla . (sigma * nabla u)
     J_x_x = torch.autograd.grad(J_x, x, grad_outputs=torch.ones_like(J_x), create_graph=True)[0]
     J_z_z = torch.autograd.grad(J_z, z, grad_outputs=torch.ones_like(J_z), create_graph=True)[0]
     
     divergence = J_x_x + J_z_z
     
-    # 4. Cálculo del Residual (Loss_PDE)
-    # expected: divergence = injection_source (para inyección de corriente puntual)
+    # 2. NUEVO: Modelar los dos electrodos con una aproximación Gaussiana
+    x_a, z_a = pos_A
+    x_b, z_b = pos_B
+    
+    # Electrodo A (Inyección: entra corriente)
+    delta_A = (1.0 / (2 * math.pi * epsilon**2)) * torch.exp(
+        -((x - x_a)**2 + (z - z_a)**2) / (2 * epsilon**2)
+    )
+    
+    # Electrodo B (Extracción: sale corriente)
+    delta_B = (1.0 / (2 * math.pi * epsilon**2)) * torch.exp(
+        -((x - x_b)**2 + (z - z_b)**2) / (2 * epsilon**2)
+    )
+    
+    # Término fuente total: Sumamos la inyección y restamos la extracción
+    injection_source = (I * delta_A) - (I * delta_B)
+    
+    # 3. Cálculo del Residual
     pde_residual = divergence - injection_source
     return torch.mean(pde_residual ** 2)
-
-def compute_tv_loss(sigma, x, z):
-    """
-    Regularización Total Variation (TV) en la conductividad.
-    Ayuda a recuperar distribuciones de subsuelo por bloques (blocky).
-    """
-    sigma_x = torch.autograd.grad(sigma, x, grad_outputs=torch.ones_like(sigma), create_graph=True)[0]
-    sigma_z = torch.autograd.grad(sigma, z, grad_outputs=torch.ones_like(sigma), create_graph=True)[0]
-    
-    # Norma L1 aproximada del gradiente espacial
-    tv_loss = torch.mean(torch.abs(sigma_x) + torch.abs(sigma_z))
-    return tv_loss
