@@ -30,13 +30,11 @@ class PINN_Sigma(nn.Module):
 
 class PINN_U(nn.Module):
     """
-    Red Neuronal para predecir el campo de Potencial Eléctrico.
-    En problemas ERT multipolo, el potencial depende de (x, z) y típicamente de la configuración de electrodos.
-    Por simplicidad, esta red condiciona a un patrón de inyección.
-    Entrada: (x, z)
-    Salida: u(x, z)
+    Red Neuronal condicionada para predecir el campo de Potencial Secundario.
+    Entrada: (x, z, a_x, a_z, b_x, b_z)
+    Salida: u_s(x, z)
     """
-    def __init__(self, in_features=2, hidden_features=64, hidden_layers=4, out_features=1):
+    def __init__(self, in_features=6, hidden_features=64, hidden_layers=4, out_features=1):
         super().__init__()
         layers = []
         layers.append(nn.Linear(in_features, hidden_features))
@@ -47,11 +45,11 @@ class PINN_U(nn.Module):
             layers.append(nn.Softplus())
             
         layers.append(nn.Linear(hidden_features, out_features))
-        # Sin activación en la última capa para permitir potenciales positivos y negativos
+        # Sin activación en la última capa
         
         self.net = nn.Sequential(*layers)
         
-    def forward(self, x, z):
-        coords = torch.cat([x, z], dim=1)
-        u = self.net(coords)
-        return u
+    def forward(self, x, z, a_x, a_z, b_x, b_z):
+        coords = torch.cat([x, z, a_x, a_z, b_x, b_z], dim=1)
+        u_s = self.net(coords)
+        return u_s

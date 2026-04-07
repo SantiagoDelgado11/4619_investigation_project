@@ -1,12 +1,12 @@
 import torch
 import torch.optim as optim
 import wandb
-from src.physics import compute_pde_loss, compute_tv_loss
+from src.physics import compute_bc_loss, compute_pde_loss_anomaly, compute_primary_potential
 
 class ERTTrainer:
     """
     Clase que orquesta el entrenamiento de las redes PINN_Sigma y PINN_U,
-    balanceando el loss de las pruebas físicas, matemáticas y regularizaciones.
+    usando formulación Anomaly (Secondary Potential) y Redes Condicionadas.
     """
     def __init__(self, model_sigma, model_u, dataloader, config):
         self.model_sigma = model_sigma
@@ -14,16 +14,14 @@ class ERTTrainer:
         self.dataloader = dataloader
         self.config = config
         
-        # Optimizador Adam
         self.optimizer = optim.Adam([
             {'params': self.model_sigma.parameters(), 'lr': config['lr_sigma']},
             {'params': self.model_u.parameters(), 'lr': config['lr_u']}
         ])
         
-        # Loss multipliers
         self.lambda_data = config.get('lambda_data', 1.0)
         self.lambda_pde = config.get('lambda_pde', 0.1)
-        self.lambda_tv = config.get('lambda_tv', 0.01)
+        self.lambda_bc = 0.05 # Nuevo peso para boundary conditions
         
     def train_epoch(self, epoch):
         self.model_sigma.train()
@@ -32,26 +30,58 @@ class ERTTrainer:
         
         for batch_idx, batch in enumerate(self.dataloader):
             self.optimizer.zero_grad()
+            batch_size = batch['M_x'].shape[0]
             
-            # Forward real measures: [Implement measurement loss matching V_pred con V_meas]
-            # data_loss = calculate_voltage_loss(self.model_u, batch)
-            data_loss = torch.tensor(0.0, requires_grad=True) # Placeholder
+            # --- 1. DATA LOSS (V_pred = V_p + V_s) ---
+            m_x = batch['M_x'].unsqueeze(1)
+            n_x = batch['N_x'].unsqueeze(1)
+            a_x = batch['A_x'].unsqueeze(1)
+            b_x = batch['B_x'].unsqueeze(1)
+            z_surf = torch.zeros_like(m_x)
             
-            # PDE Loss (Collocation points over domain)
-            # Sample random points in the 2D domain (x, z)
-            # x_col = torch.rand(batch_size, 1, requires_grad=True)
-            # z_col = torch.rand(batch_size, 1, requires_grad=True)
-            # u_pred = self.model_u(x_col, z_col)
-            # sigma_pred = self.model_sigma(x_col, z_col)
-            # pde_loss = compute_pde_loss(u_pred, sigma_pred, x_col, z_col, injection=0.0)
-            pde_loss = torch.tensor(0.0, requires_grad=True) # Placeholder
+            # V_p Analítico
+            u_p_M = compute_primary_potential(m_x, z_surf, pos_A=(a_x, z_surf), pos_B=(b_x, z_surf))
+            u_p_N = compute_primary_potential(n_x, z_surf, pos_A=(a_x, z_surf), pos_B=(b_x, z_surf))
+            V_p = u_p_M - u_p_N
             
-            # TV Loss on conductivity map
-            # tv_loss = compute_tv_loss(sigma_pred, x_col, z_col)
-            tv_loss = torch.tensor(0.0, requires_grad=True) # Placeholder
+            # V_s Red Neuronal Condicionada
+            u_s_M = self.model_u(m_x, z_surf, a_x, z_surf, b_x, z_surf)
+            u_s_N = self.model_u(n_x, z_surf, a_x, z_surf, b_x, z_surf)
+            V_s = u_s_M - u_s_N
             
-            # Composite Loss
-            loss = (self.lambda_data * data_loss) + (self.lambda_pde * pde_loss) + (self.lambda_tv * tv_loss)
+            V_pred = V_p + V_s
+            V_meas = batch['V_meas'].unsqueeze(1)
+            data_loss = torch.mean((V_pred - V_meas)**2)
+            
+            # --- 2. PDE LOSS (Collocation Points en Malla Dominio + Inyecciones Mixtas) ---
+            # Dominio x:[0, 100], z:[0, 50]
+            x_col = (torch.rand(batch_size, 1, requires_grad=True) * 100.0)
+            z_col = (torch.rand(batch_size, 1, requires_grad=True) * 50.0)
+            
+            a_x_col = torch.rand(batch_size, 1) * 100.0
+            b_x_col = torch.rand(batch_size, 1) * 100.0
+            z_surf_col = torch.zeros_like(a_x_col)
+            
+            u_s_pred = self.model_u(x_col, z_col, a_x_col, z_surf_col, b_x_col, z_surf_col)
+            sigma_pred = self.model_sigma(x_col, z_col)
+            
+            pde_loss = compute_pde_loss_anomaly(
+                u_s_pred, sigma_pred, x_col, z_col, 
+                pos_A=(a_x_col, z_surf_col), pos_B=(b_x_col, z_surf_col)
+            )
+            
+            # --- 3. BOUNDARY CONDITION LOSS ---
+            x_bc = torch.rand(batch_size, 1) * 100.0
+            z_bc_surf = torch.zeros_like(x_bc)
+            z_bc_deep = torch.ones_like(x_bc) * 50.0 
+            
+            bc_loss = compute_bc_loss(
+                self.model_u, x_bc, z_bc_surf, z_bc_deep, 
+                a_x_col, z_surf_col, b_x_col, z_surf_col
+            )
+            
+            # --- COMPOSITE LOSS ---
+            loss = (self.lambda_data * data_loss) + (self.lambda_pde * pde_loss) + (self.lambda_bc * bc_loss)
             loss.backward()
             self.optimizer.step()
             
