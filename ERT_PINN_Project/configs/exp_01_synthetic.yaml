@@ -7,7 +7,7 @@ network:
 
 # Hiperparametros de Entrenamiento
 training:
-  epochs: 2
+  epochs: 1000
   lr_sigma: 0.001
   lr_u: 0.001
   batch_size: 256
