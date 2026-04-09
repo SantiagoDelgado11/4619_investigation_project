@@ -1,183 +1,237 @@
+"""PINN con restricciones duras para el problema inverso 3D de ERT.
+
+Ecuación gobernante:
+    -∇·(σ∇u)=Iδ(r-r_A)-Iδ(r-r_B)
+
+Las condiciones de frontera se imponen por construcción (hard constraints):
+- Dirichlet: u -> 0 al alejarse (envolvente de decaimiento).
+- Neumann en topografía (z=0): n·(σ∇u)=0 exacta mediante simetría par en z.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Dict, Tuple
+
 import torch
 import torch.nn as nn
-import math
 
-class PINN_Sigma_3D(nn.Module):
-    """
-    Red Neuronal para predecir el campo de Conductividad 3D.
-    Entrada: (x, y, z)
-    Salida: sigma(x, y, z) (> 0)
-    """
-    def __init__(self, in_features=3, hidden_features=64, hidden_layers=4, out_features=1):
+Tensor = torch.Tensor
+
+
+@dataclass
+class LossWeights:
+    data: float = 100.0
+    pde: float = 1.0
+
+
+class FourierFeatures(nn.Module):
+    """Embedding sen/cos para aumentar expresividad espacial."""
+
+    def __init__(self, in_features: int = 3, n_frequencies: int = 16, scale: float = 1.0) -> None:
         super().__init__()
-        layers = []
-        layers.append(nn.Linear(in_features, hidden_features))
-        layers.append(nn.Tanh()) 
-        
-        for _ in range(hidden_layers - 1):
-            layers.append(nn.Linear(hidden_features, hidden_features))
-            layers.append(nn.Tanh())
-            
-        layers.append(nn.Linear(hidden_features, out_features))
-        layers.append(nn.Softplus()) # Asegurar que sigma > 0
-        
-        self.net = nn.Sequential(*layers)
-        
-    def forward(self, x, y, z):
-        coords = torch.cat([x, y, z], dim=1)
-        return self.net(coords)
+        self.register_buffer("B", torch.randn(in_features, n_frequencies) * scale)
+
+    def forward(self, coords: Tensor) -> Tensor:
+        proj = 2.0 * math.pi * coords @ self.B
+        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
 
-class PINN_U_3D_Hard(nn.Module):
-    """
-    Red Neuronal para predecir el Potencial Eléctrico 3D (Hard Constraints).
-    
-    Implementa un Ansatz que fuerza matemáticamente el cumplimiento de 
-    las condiciones de frontera sin importar los pesos de la red:
-    - Dirichlet (v -> 0 cuando r -> inf)
-    - Neumann (dv/dz = 0 en z=0)
-    """
-    def __init__(self, in_features=3, hidden_features=64, hidden_layers=4, out_features=1, L=100.0):
+class MLP(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int = 128, hidden_layers: int = 6) -> None:
         super().__init__()
-        self.L = L # Parámetro espacial para escalado del decaimiento
-        
-        layers = []
-        layers.append(nn.Linear(in_features, hidden_features))
-        layers.append(nn.Tanh())
-        
+        layers: list[nn.Module] = [nn.Linear(in_features, hidden_features), nn.Tanh()]
         for _ in range(hidden_layers - 1):
-            layers.append(nn.Linear(hidden_features, hidden_features))
-            layers.append(nn.Tanh())
-            
-        layers.append(nn.Linear(hidden_features, out_features))
-        
+            layers.extend([nn.Linear(hidden_features, hidden_features), nn.Tanh()])
+        layers.append(nn.Linear(hidden_features, 1))
         self.net = nn.Sequential(*layers)
-        
-    def forward(self, x, y, z):
-        # 1. Alimentamos a la red con z^2 en vez de z para asegurar simetría respecto a z=0
-        z_squared = z**2
-        coords = torch.cat([x, y, z_squared], dim=1)
-        raw_u = self.net(coords)
-        
-        # 2. Ansatz para imponer Hard Constraints:
-        # Multiplicamos por una función envolvente gaussiana.
-        # r^2 = x^2 + y^2 + z^2
-        r2 = x**2 + y**2 + z**2
-        decay_envelope = torch.exp(-r2 / (self.L**2))
-        
-        # Demostración del Ansatz:
-        # A) En r -> infinito, decay_envelope -> 0. Luego u -> 0. (Cumple Dirichlet)
-        # B) Para la derivada en la superficie (z=0):
-        # d_u/d_z = decay_envelope * (-2z/L^2) * raw_u + decay_envelope * d_raw_u/d_z
-        # Por la regla de la cadena: d_raw_u/d_z = (d_raw_u/d_z^2) * 2z
-        # En consecuencia ambos sumandos tienen 'z'. Al evaluar en z=0, d_u/d_z = 0. (Cumple Neumann Estricto).
-        
-        u_constrained = decay_envelope * raw_u
-        return u_constrained
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
 
 
-def compute_pde_loss_3d_hard(u_model, sigma_model, x, y, z, pos_A, pos_B, I=1.0, epsilon=0.1):
-    """
-    Calcula el residual de la PDE con fuentes puntuales en 3D.
-    Ya no se calculan las condiciones de frontera aquí, solo la física del dominio.
-    """
-    u = u_model(x, y, z)
-    sigma = sigma_model(x, y, z)
-    
-    # 1. Gradiente de u
-    u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-    u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-    u_z = torch.autograd.grad(u, z, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-    
-    Jx = sigma * u_x
-    Jy = sigma * u_y
-    Jz = sigma * u_z
-    
-    # 2. Divergencia
-    Jx_x = torch.autograd.grad(Jx, x, grad_outputs=torch.ones_like(Jx), create_graph=True)[0]
-    Jy_y = torch.autograd.grad(Jy, y, grad_outputs=torch.ones_like(Jy), create_graph=True)[0]
-    Jz_z = torch.autograd.grad(Jz, z, grad_outputs=torch.ones_like(Jz), create_graph=True)[0]
-    
-    divergence = Jx_x + Jy_y + Jz_z
-    
-    # 3. Término sumidero-fuente (Electrodos A y B) en 3D
-    xA, yA, zA = pos_A
-    xB, yB, zB = pos_B
-    norm = 1.0 / ((2 * math.pi * epsilon**2)**1.5)
-    delta_A = norm * torch.exp(-((x - xA)**2 + (y - yA)**2 + (z - zA)**2) / (2 * epsilon**2))
-    delta_B = norm * torch.exp(-((x - xB)**2 + (y - yB)**2 + (z - zB)**2) / (2 * epsilon**2))
-    
-    source = I * delta_A - I * delta_B
-    
-    # Residual: div(sigma*grad(u)) = fuente-sumidero <=> divergence + source = 0
-    pde_residual = divergence + source
-    return torch.mean(pde_residual**2)
+class ConductivityNet(nn.Module):
+    """σ(x,y,z)>0 usando Softplus."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.base = MLP(in_features=3)
+        self.softplus = nn.Softplus(beta=2.0)
+
+    def forward(self, coords: Tensor) -> Tensor:
+        return self.softplus(self.base(coords)) + 1e-6
 
 
-def train_step_hard(u_model, sigma_model, optimizer, domain_pts, data_pts, vals_obs, pos_A, pos_B):
-    """
-    Paso de entrenamiento simplificado debido a las Hard Constraints.
-    """
+class PotentialNetHard(nn.Module):
+    """u(x,y,z) con fronteras satisfechas exactamente por diseño."""
+
+    def __init__(self, n_frequencies: int = 24, fourier_scale: float = 0.15, decay_scale: float = 20.0) -> None:
+        super().__init__()
+        self.decay_scale = decay_scale
+        self.embed = FourierFeatures(in_features=3, n_frequencies=n_frequencies, scale=fourier_scale)
+        # coords_sym = (x, y, z^2) fuerza simetría par respecto de z.
+        self.base = MLP(in_features=3 + 2 * n_frequencies)
+
+    def forward(self, coords: Tensor) -> Tensor:
+        x = coords[:, 0:1]
+        y = coords[:, 1:2]
+        z = coords[:, 2:3]
+
+        coords_sym = torch.cat([x, y, z.pow(2)], dim=1)
+        fourier = self.embed(coords_sym)
+        latent = torch.cat([coords_sym, fourier], dim=1)
+        raw = self.base(latent)
+
+        # Envolvente de distancia: garantiza u -> 0 cuando ||r|| -> inf (Dirichlet exacta).
+        r2 = x.pow(2) + y.pow(2) + z.pow(2)
+        envelope = torch.exp(-r2 / (self.decay_scale**2))
+
+        # Hard constraints: u = envelope * raw(x,y,z^2)
+        # Debido a z^2, ∂raw/∂z|_{z=0}=0. Además ∂envelope/∂z|_{z=0}=0.
+        # => ∂u/∂z|_{z=0}=0 y por tanto n·(σ∇u)=0 en superficie plana z=0.
+        return envelope * raw
+
+
+def gradient(field: Tensor, coords: Tensor) -> Tensor:
+    return torch.autograd.grad(
+        field,
+        coords,
+        grad_outputs=torch.ones_like(field),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+
+def gaussian_delta_3d(coords: Tensor, center: Tuple[float, float, float], epsilon: float) -> Tensor:
+    c = coords.new_tensor(center).view(1, 3)
+    r2 = torch.sum((coords - c) ** 2, dim=1, keepdim=True)
+    norm = 1.0 / ((2.0 * math.pi * epsilon**2) ** 1.5)
+    return norm * torch.exp(-r2 / (2.0 * epsilon**2))
+
+
+def poisson_residual(
+    u_model: nn.Module,
+    sigma_model: nn.Module,
+    coords: Tensor,
+    pos_a: Tuple[float, float, float],
+    pos_b: Tuple[float, float, float],
+    current: float = 1.0,
+    epsilon: float = 0.2,
+) -> Tensor:
+    """Residual de la física sin términos de frontera en loss."""
+
+    u = u_model(coords)
+    sigma = sigma_model(coords)
+
+    grad_u = gradient(u, coords)
+    flux = sigma * grad_u
+
+    div = 0.0
+    for axis in range(3):
+        comp = flux[:, axis : axis + 1]
+        dcomp = torch.autograd.grad(
+            comp,
+            coords,
+            grad_outputs=torch.ones_like(comp),
+            create_graph=True,
+            retain_graph=True,
+        )[0][:, axis : axis + 1]
+        div = div + dcomp
+
+    source = current * gaussian_delta_3d(coords, pos_a, epsilon) - current * gaussian_delta_3d(
+        coords, pos_b, epsilon
+    )
+    return div + source
+
+
+def compute_hard_losses(
+    u_model: nn.Module,
+    sigma_model: nn.Module,
+    collocation_coords: Tensor,
+    receiver_coords: Tensor,
+    observed_potential: Tensor,
+    pos_a: Tuple[float, float, float],
+    pos_b: Tuple[float, float, float],
+    weights: LossWeights,
+) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """Loss simplificada: datos + PDE (sin penalizaciones de frontera)."""
+
+    residual = poisson_residual(u_model, sigma_model, collocation_coords, pos_a, pos_b)
+    loss_pde = torch.mean(residual.pow(2))
+
+    pred_receivers = u_model(receiver_coords)
+    loss_data = torch.mean((pred_receivers - observed_potential).pow(2))
+
+    total = weights.data * loss_data + weights.pde * loss_pde
+    return total, {"total": total.detach(), "data": loss_data.detach(), "pde": loss_pde.detach()}
+
+
+def train_step_hard(
+    u_model: nn.Module,
+    sigma_model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    collocation_coords: Tensor,
+    receiver_coords: Tensor,
+    observed_potential: Tensor,
+    pos_a: Tuple[float, float, float],
+    pos_b: Tuple[float, float, float],
+    weights: LossWeights,
+) -> Dict[str, float]:
     optimizer.zero_grad()
-    
-    x, y, z = domain_pts
-    x.requires_grad_(True)
-    y.requires_grad_(True)
-    z.requires_grad_(True)
-    
-    # Loss PDE (Término Físico central)
-    loss_pde = compute_pde_loss_3d_hard(u_model, sigma_model, x, y, z, pos_A, pos_B)
-    
-    # Loss Data (Fidelidad de datos)
-    xd, yd, zd = data_pts
-    u_pred = u_model(xd, yd, zd)
-    loss_data = torch.mean((u_pred - vals_obs)**2)
-    
-    # Loss Total Simplificada: NO hay lambdas de frontera (lambda_neu, lambda_dir)
-    lambda_pde = 1.0
-    lambda_data = 100.0
-    
-    total_loss = (lambda_pde * loss_pde) + (lambda_data * loss_data)
-    
-    total_loss.backward()
+
+    collocation_coords = collocation_coords.requires_grad_(True)
+
+    total, losses = compute_hard_losses(
+        u_model=u_model,
+        sigma_model=sigma_model,
+        collocation_coords=collocation_coords,
+        receiver_coords=receiver_coords,
+        observed_potential=observed_potential,
+        pos_a=pos_a,
+        pos_b=pos_b,
+        weights=weights,
+    )
+
+    total.backward()
     optimizer.step()
-    
-    return total_loss.item(), loss_pde.item(), loss_data.item()
+    return {k: float(v.item()) for k, v in losses.items()}
+
 
 if __name__ == "__main__":
-    # Test local de construcción y gradientes
-    print("Iniciando entrenamiento PINN 3D con Hard Constraints...")
-    u_net = PINN_U_3D_Hard(L=50.0)
-    sigma_net = PINN_Sigma_3D()
-    
+    torch.manual_seed(7)
+
+    u_net = PotentialNetHard()
+    sigma_net = ConductivityNet()
     optimizer = torch.optim.Adam(list(u_net.parameters()) + list(sigma_net.parameters()), lr=1e-3)
-    
-    # Puntos de dominio para PDE
-    domain_x = torch.rand(100, 1) * 10 - 5
-    domain_y = torch.rand(100, 1) * 10 - 5
-    domain_z = torch.rand(100, 1) * 10  # z >= 0
-    
-    # Datos sintéticos para pérdida Data
-    data_x = torch.zeros(5, 1)
-    data_y = torch.zeros(5, 1)
-    data_z = torch.zeros(5, 1)
-    vals_obs = torch.ones(5, 1) * 0.5
-    
-    pos_A = (-2.0, 0.0, 0.0)
-    pos_B = (2.0, 0.0, 0.0)
-    
-    loss_val = train_step_hard(u_net, sigma_net, optimizer, 
-                               (domain_x, domain_y, domain_z), 
-                               (data_x, data_y, data_z), 
-                               vals_obs, pos_A, pos_B)
-                          
-    print(f"Iter 1 | Total Loss: {loss_val[0]:.4f} | PDE: {loss_val[1]:.4f} | Data: {loss_val[2]:.4f}")
-    
-    # Comprobación analítica rápida de Neumann: dh/dz en z=0
-    test_x = torch.tensor([[1.0]], requires_grad=True)
-    test_y = torch.tensor([[1.0]], requires_grad=True)
-    test_z = torch.tensor([[0.0]], requires_grad=True) # Superficie
-    
-    u_test = u_net(test_x, test_y, test_z)
-    u_z_test = torch.autograd.grad(u_test, test_z, grad_outputs=torch.ones_like(u_test))[0]
-    print(f"Comprobación Analítica de Neumann (d_u/d_z en z=0): {u_z_test.item()} (Debería ser ~0)")
+
+    collocation = torch.rand(512, 3)
+    collocation[:, 0] = collocation[:, 0] * 20.0 - 10.0
+    collocation[:, 1] = collocation[:, 1] * 20.0 - 10.0
+    collocation[:, 2] = collocation[:, 2] * 10.0
+
+    receivers = torch.rand(32, 3)
+    receivers[:, 0] = receivers[:, 0] * 20.0 - 10.0
+    receivers[:, 1] = receivers[:, 1] * 20.0 - 10.0
+    receivers[:, 2] = 0.0
+
+    observed = torch.zeros(32, 1)
+    pos_a, pos_b = (-3.0, 0.0, 0.0), (3.0, 0.0, 0.0)
+
+    metrics = train_step_hard(
+        u_model=u_net,
+        sigma_model=sigma_net,
+        optimizer=optimizer,
+        collocation_coords=collocation,
+        receiver_coords=receivers,
+        observed_potential=observed,
+        pos_a=pos_a,
+        pos_b=pos_b,
+        weights=LossWeights(),
+    )
+    print(f"Hard PINN | total={metrics['total']:.4e}, data={metrics['data']:.4e}, pde={metrics['pde']:.4e}")
+
+    # Validación rápida de Neumann exacta en z=0.
+    test = torch.tensor([[1.0, -2.0, 0.0]], requires_grad=True)
+    uz = gradient(u_net(test), test)[:, 2].item()
+    print(f"Chequeo d u/dz en z=0: {uz:.4e} (esperado ~0 por construcción)")
